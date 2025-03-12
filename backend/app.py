@@ -47,10 +47,6 @@ def get_available_models() -> List[str]:
     model_dirs = [d for d in os.listdir(MODEL_DIR) 
                  if os.path.isdir(os.path.join(MODEL_DIR, d))]
     
-    # If no models are found, add a default one for demo purposes
-    if not model_dirs:
-        model_dirs = ["llava-v1.5-7b"]
-        
     return model_dirs
 
 def allowed_file(filename: str) -> bool:
@@ -94,119 +90,76 @@ def load_model(model_name: str) -> Dict[str, Any]:
         
         model_path = os.path.join(MODEL_DIR, model_name)
         
-        # For demonstration, if the model doesn't exist, we'll simulate it
         if not os.path.exists(model_path):
-            os.makedirs(model_path, exist_ok=True)
+            return {"success": False, "message": f"Model path {model_path} does not exist"}
             
-            # Simulate model loading with progress updates
-            for progress in range(0, 101, 10):
-                socketio.emit('model_status', {
-                    'type': 'model_status',
-                    'name': model_name,
-                    'loaded': False,
-                    'progress': progress
-                })
-                time.sleep(0.5)  # Simulate loading time
-                
-            # For demonstration purposes, we're simulating a model
-            # In a real app, you would use:
-            # loaded_processor = AutoProcessor.from_pretrained(model_path)
-            # loaded_model = AutoModelForVision2Seq.from_pretrained(
-            #     model_path,
-            #     torch_dtype=torch.float16,
-            #     low_cpu_mem_usage=True,
-            #     device_map="auto" if cuda_available else None
-            # )
-            
-            # Mock the model and processor for demonstration
-            class MockProcessor:
-                def __call__(self, images, text=None, return_tensors="pt"):
-                    return {"pixel_values": torch.rand(1, 3, 224, 224), "input_ids": torch.tensor([[1, 2, 3, 4, 5]])}
-            
-            class MockModel:
-                def __init__(self):
-                    self.device = device
-                    
-                def generate(self, **kwargs):
-                    return torch.tensor([[10, 20, 30, 40, 50, 60, 70, 80, 90, 100]])
-                
-                def to(self, device):
-                    return self
-            
-            loaded_processor = MockProcessor()
-            loaded_model = MockModel()
-            
-            # Final status update - model loaded
-            socketio.emit('model_status', {
-                'type': 'model_status',
-                'name': model_name,
-                'loaded': True,
-                'progress': 100
-            })
-            
-            return {"success": True, "message": f"Model {model_name} loaded successfully"}
+        # Progress update - 10%
+        socketio.emit('model_status', {
+            'type': 'model_status',
+            'name': model_name, 
+            'loaded': False,
+            'progress': 10
+        })
         
-        # Actual model loading logic
+        # Load processor
         try:
-            # Progress update - 10%
-            socketio.emit('model_status', {
-                'type': 'model_status',
-                'name': model_name, 
-                'loaded': False,
-                'progress': 10
-            })
-            
-            # Load processor
             loaded_processor = AutoProcessor.from_pretrained(model_path)
-            
-            # Progress update - 30%
-            socketio.emit('model_status', {
-                'type': 'model_status',
-                'name': model_name,
-                'loaded': False, 
-                'progress': 30
-            })
-            
-            # Determine if we can fit in VRAM
-            use_device_map = "auto"
-            
-            if cuda_available:
-                # Check available VRAM
-                total_vram = torch.cuda.get_device_properties(0).total_memory
-                if total_vram <= vram_limit:
-                    # Use CPU offloading if VRAM is limited
-                    use_device_map = {"": "cpu"}
-            
-            # Progress update - 50%
-            socketio.emit('model_status', {
-                'type': 'model_status', 
-                'name': model_name,
-                'loaded': False,
-                'progress': 50
-            })
-            
-            # Load model with appropriate settings
+        except Exception as e:
+            return {"success": False, "message": f"Error loading processor: {str(e)}"}
+        
+        # Progress update - 30%
+        socketio.emit('model_status', {
+            'type': 'model_status',
+            'name': model_name,
+            'loaded': False, 
+            'progress': 30
+        })
+        
+        # Determine if we can fit in VRAM or need CPU offloading
+        use_device_map = "auto"  # Default to auto for best performance
+        
+        if cuda_available:
+            # Check available VRAM
+            total_vram = torch.cuda.get_device_properties(0).total_memory
+            if total_vram <= vram_limit:
+                # Use CPU offloading if VRAM is limited
+                use_device_map = {"": "cpu"}
+                print(f"Limited VRAM detected ({total_vram / 1e9:.2f} GB). Using CPU offloading.")
+        
+        # Progress update - 50%
+        socketio.emit('model_status', {
+            'type': 'model_status', 
+            'name': model_name,
+            'loaded': False,
+            'progress': 50
+        })
+        
+        # Load model with appropriate settings
+        try:
             loaded_model = AutoModelForVision2Seq.from_pretrained(
                 model_path,
                 torch_dtype=torch.float16 if cuda_available else torch.float32,
                 low_cpu_mem_usage=True,
                 device_map=use_device_map
             )
-            
-            # Progress updates 70% -> 100%
-            for progress in range(70, 101, 10):
-                socketio.emit('model_status', {
-                    'type': 'model_status',
-                    'name': model_name,
-                    'loaded': progress == 100,
-                    'progress': progress
-                })
-                time.sleep(0.2)  # Small delay for visual feedback
-            
-            return {"success": True, "message": f"Model {model_name} loaded successfully"}
-        
         except Exception as e:
+            loaded_processor = None  # Clean up if model loading fails
             return {"success": False, "message": f"Error loading model: {str(e)}"}
+        
+        # Progress updates 70% -> 100%
+        for progress in range(70, 101, 10):
+            socketio.emit('model_status', {
+                'type': 'model_status',
+                'name': model_name,
+                'loaded': progress == 100,
+                'progress': progress
+            })
+            time.sleep(0.2)  # Small delay for visual feedback
+        
+        return {"success": True, "message": f"Model {model_name} loaded successfully"}
+    
+    except Exception as e:
+        return {"success": False, "message": f"Error loading model: {str(e)}"}
     
     finally:
         model_loading = False
@@ -256,13 +209,10 @@ def process_image(image: Image.Image) -> str:
         # Send initial progress update for processing
         socketio.emit('processing', {
             'type': 'processing',
-            'progress': 0
+            'progress': 10
         })
         
-        # Generate prediction with progress updates
-        # In a real implementation, you'd use the model's generate method
-        # Here we'll simulate the progression
-        
+        # Generate prediction
         with torch.no_grad():
             # Model inference
             output_ids = loaded_model.generate(
@@ -270,6 +220,12 @@ def process_image(image: Image.Image) -> str:
                 max_length=512,
                 do_sample=False
             )
+            
+            # Update progress during generation
+            socketio.emit('processing', {
+                'type': 'processing',
+                'progress': 75
+            })
         
         # Send final progress update
         socketio.emit('processing', {
@@ -282,7 +238,9 @@ def process_image(image: Image.Image) -> str:
             result = loaded_processor.batch_decode(output_ids, skip_special_tokens=True)[0]
         else:
             # Fallback for models without batch_decode
-            result = "This is a detailed description of the image. [Sample output for demonstration]"
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_DIR, current_model_name))
+            result = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         
         return result
     
@@ -379,7 +337,12 @@ def handle_load_model(data):
     
     # Start model loading in a separate thread to not block the server
     def load_model_thread():
-        load_model(model_name)
+        result = load_model(model_name)
+        if not result["success"]:
+            socketio.emit("error", {
+                "type": "error",
+                "message": result["message"]
+            })
     
     threading.Thread(target=load_model_thread).start()
     
@@ -505,6 +468,19 @@ if __name__ == "__main__":
     use_tunnel = "--tunnel" in sys.argv
     
     print(f"Starting Flask server on port {port}")
+    print(f"CUDA available: {cuda_available}")
+    
+    if cuda_available:
+        gpu_name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
+        print(f"GPU: {gpu_name} with {vram:.2f} GB VRAM")
+    
+    # Display available models
+    models = get_available_models()
+    if models:
+        print(f"Available models: {', '.join(models)}")
+    else:
+        print("No models found in the models directory. Please add models to:", MODEL_DIR)
     
     # Start localhost.run tunnel if requested
     tunnel_process = None
