@@ -1,4 +1,3 @@
-// src/App.js
 import React, { useState, useEffect, useRef } from 'react';
 import { ThemeProvider, createTheme } from '@mui/material/styles';
 import CssBaseline from '@mui/material/CssBaseline';
@@ -7,7 +6,7 @@ import {
   Button, IconButton, CircularProgress, MenuItem,
   Select, FormControl, InputLabel, LinearProgress,
   Dialog, DialogTitle, DialogContent, DialogContentText,
-  Snackbar, Alert, Box, Grid, Switch, FormControlLabel
+  Snackbar, Alert, Box, Grid
 } from '@mui/material';
 import {
   CameraAlt as CameraIcon,
@@ -18,6 +17,7 @@ import {
   EjectOutlined as EjectIcon
 } from '@mui/icons-material';
 import { useDropzone } from 'react-dropzone';
+import { io } from 'socket.io-client';
 import './App.css';
 
 // Theme configuration
@@ -53,7 +53,7 @@ function App() {
   
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
-  const wsRef = useRef(null);
+  const socketRef = useRef(null);
 
   // Dropzone configuration for gallery uploads
   const { getRootProps, getInputProps } = useDropzone({
@@ -65,60 +65,62 @@ function App() {
     }
   });
 
-  // Initialize websocket connection
+  // Initialize socket.io connection
   useEffect(() => {
     // Check if we're on HTTPS
     if (window.location.protocol !== 'https:') {
-      showNotification('This app requires HTTPS to access camera features.', 'error');
+      showNotification('This app works best with HTTPS to access camera features.', 'warning');
     }
 
-    // Establish WebSocket connection
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    // Establish Socket.IO connection
+    const socket = io();
+    socketRef.current = socket;
     
-    wsRef.current = new WebSocket(wsUrl);
-    
-    wsRef.current.onopen = () => {
+    socket.on('connect', () => {
       setIsConnected(true);
       setConnectionDialogOpen(true);
       fetchAvailableModels();
-    };
+    });
     
-    wsRef.current.onclose = () => {
+    socket.on('disconnect', () => {
       setIsConnected(false);
       showNotification('Connection to server lost. Please refresh.', 'error');
-    };
+    });
     
-    wsRef.current.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      
-      if (data.type === 'models') {
-        setAvailableModels(data.models);
-        if (data.models.length > 0) {
-          setSelectedModel(data.models[0]);
-        }
-      } else if (data.type === 'model_status') {
-        setModelLoaded(data.loaded);
-        setLoadingProgress(data.progress || 0);
-        if (data.loaded) {
-          showNotification(`Model ${data.name} loaded successfully`, 'success');
-        }
-      } else if (data.type === 'processing') {
-        setProcessingProgress(data.progress || 0);
-      } else if (data.type === 'result') {
-        setRecognitionResult(data.result);
-        setIsProcessing(false);
-        showNotification('Image recognition complete!', 'success');
-      } else if (data.type === 'error') {
-        showNotification(data.message, 'error');
-        setIsProcessing(false);
+    socket.on('models', (data) => {
+      setAvailableModels(data.models);
+      if (data.models.length > 0) {
+        setSelectedModel(data.models[0]);
       }
-    };
+    });
+    
+    socket.on('model_status', (data) => {
+      setModelLoaded(data.loaded);
+      setLoadingProgress(data.progress || 0);
+      if (data.loaded) {
+        showNotification(`Model ${data.name} loaded successfully`, 'success');
+      }
+    });
+    
+    socket.on('processing', (data) => {
+      setProcessingProgress(data.progress || 0);
+    });
+    
+    socket.on('result', (data) => {
+      setRecognitionResult(data.result);
+      setIsProcessing(false);
+      showNotification('Image recognition complete!', 'success');
+    });
+    
+    socket.on('error', (data) => {
+      showNotification(data.message, 'error');
+      setIsProcessing(false);
+    });
     
     // Cleanup function
     return () => {
-      if (wsRef.current) {
-        wsRef.current.close();
+      if (socketRef.current) {
+        socketRef.current.disconnect();
       }
       stopCamera();
     };
@@ -151,8 +153,8 @@ function App() {
   }, [selectedCamera, facingMode]);
 
   const fetchAvailableModels = () => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ action: 'get_models' }));
+    if (socketRef.current && socketRef.current.connected) {
+      socketRef.current.emit('get_models');
     }
   };
 
@@ -237,12 +239,11 @@ function App() {
     setProcessingProgress(0);
     setRecognitionResult(null);
     
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        action: 'process_image',
+    if (socketRef.current && socketRef.current.connected) {
+      socketRef.current.emit('process_image', {
         image: capturedImage,
         model: selectedModel
-      }));
+      });
     }
   };
 
@@ -254,11 +255,10 @@ function App() {
     
     setLoadingProgress(0);
     
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        action: 'load_model',
+    if (socketRef.current && socketRef.current.connected) {
+      socketRef.current.emit('load_model', {
         model: selectedModel
-      }));
+      });
     }
   };
 
@@ -268,10 +268,8 @@ function App() {
       return;
     }
     
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        action: 'unload_model'
-      }));
+    if (socketRef.current && socketRef.current.connected) {
+      socketRef.current.emit('unload_model');
       setModelLoaded(false);
       showNotification('Model unloaded from GPU', 'info');
     }

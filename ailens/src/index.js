@@ -1,4 +1,3 @@
-// frontend/src/index.js (PWA registration addition)
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';
@@ -11,3 +10,6 @@ root.render(
     <App />
   </React.StrictMode>
 );
+
+// Register the service worker for PWA capabilities
+serviceWorkerRegistration.register();
