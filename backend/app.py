@@ -7,6 +7,7 @@ import asyncio
 import threading
 import subprocess
 import glob
+import eventlet
 from pathlib import Path
 from io import BytesIO
 from typing import List, Dict, Any, Optional
@@ -30,6 +31,9 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app = Flask(__name__, static_folder='./client/build')
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+eventlet.monkey_patch()
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 # Global variables
 loaded_model = None
