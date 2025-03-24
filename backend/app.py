@@ -1,3 +1,5 @@
+import eventlet
+eventlet.monkey_patch()
 import os
 import sys
 import json
@@ -7,7 +9,6 @@ import asyncio
 import threading
 import subprocess
 import glob
-import eventlet
 from pathlib import Path
 from io import BytesIO
 from typing import List, Dict, Any, Optional
@@ -107,7 +108,10 @@ def load_model(model_name: str) -> Dict[str, Any]:
         
         # Load processor
         try:
-            loaded_processor = AutoProcessor.from_pretrained(model_path)
+            loaded_processor = AutoProcessor.from_pretrained(
+                model_path,
+                trust_remote_code=True
+            )
         except Exception as e:
             return {"success": False, "message": f"Error loading processor: {str(e)}"}
         
@@ -144,7 +148,8 @@ def load_model(model_name: str) -> Dict[str, Any]:
                 model_path,
                 torch_dtype=torch.float16 if cuda_available else torch.float32,
                 low_cpu_mem_usage=True,
-                device_map=use_device_map
+                device_map=use_device_map,
+                trust_remote_code=True
             )
         except Exception as e:
             loaded_processor = None  # Clean up if model loading fails
@@ -156,7 +161,8 @@ def load_model(model_name: str) -> Dict[str, Any]:
                 'type': 'model_status',
                 'name': model_name,
                 'loaded': progress == 100,
-                'progress': progress
+                'progress': progress,
+                'cuda_available': cuda_available
             })
             time.sleep(0.2)  # Small delay for visual feedback
         
