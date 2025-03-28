@@ -14,7 +14,8 @@ import {
   PhotoLibrary as GalleryIcon,
   Send as SendIcon,
   Memory as MemoryIcon,
-  EjectOutlined as EjectIcon
+  EjectOutlined as EjectIcon,
+  Cancel as CancelIcon
 } from '@mui/icons-material';
 import { useDropzone } from 'react-dropzone';
 import { io } from 'socket.io-client';
@@ -50,10 +51,13 @@ function App() {
   const [notification, setNotification] = useState({ open: false, message: '', severity: 'info' });
   const [availableCameras, setAvailableCameras] = useState([]);
   const [selectedCamera, setSelectedCamera] = useState('');
+  const [processingId, setProcessingId] = useState(null);
+  const [estimatedTimeRemaining, setEstimatedTimeRemaining] = useState(null);
   
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const socketRef = useRef(null);
+  const processingStartTimeRef = useRef(null);
 
   // Dropzone configuration for gallery uploads
   const { getRootProps, getInputProps } = useDropzone({
@@ -73,7 +77,31 @@ function App() {
     }
 
     // Establish Socket.IO connection
-    const socket = io();
+    const socket = io({
+      path: '/socket.io',
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 60000,
+      transports: ['websocket', 'polling']  // Try websocket first
+    });
+
+    socket.io.on("reconnect_attempt", (attempt) => {
+      console.log(`Reconnection attempt ${attempt}`);
+      showNotification(`Reconnection attempt ${attempt}...`, 'warning');
+    });
+    
+    socket.io.on("reconnect_error", (error) => {
+      console.error("Reconnection error:", error);
+      showNotification('Reconnection error', 'error');
+    });
+    
+    socket.io.on("reconnect", (attempt) => {
+      console.log(`Reconnected after ${attempt} attempts`);
+      showNotification('Reconnected to server', 'success');
+    });
+    
     socketRef.current = socket;
     
     socket.on('connect', () => {
@@ -103,18 +131,44 @@ function App() {
     });
     
     socket.on('processing', (data) => {
-      setProcessingProgress(data.progress || 0);
+      const progress = data.progress || 0;
+      setProcessingProgress(progress);
+      
+      // Update processing ID if provided
+      if (data.processing_id) {
+        setProcessingId(data.processing_id);
+      }
+      
+      // Calculate estimated time remaining
+      if (processingStartTimeRef.current && progress > 0 && progress < 100) {
+        const elapsedTime = (Date.now() - processingStartTimeRef.current) / 1000; // in seconds
+        const estimatedTotal = elapsedTime / (progress / 100);
+        const remaining = Math.round(estimatedTotal - elapsedTime);
+        setEstimatedTimeRemaining(remaining);
+      }
     });
     
     socket.on('result', (data) => {
       setRecognitionResult(data.result);
       setIsProcessing(false);
+      setProcessingId(null);
+      setEstimatedTimeRemaining(null);
       showNotification('Image recognition complete!', 'success');
     });
     
     socket.on('error', (data) => {
       showNotification(data.message, 'error');
       setIsProcessing(false);
+      setProcessingId(null);
+      setEstimatedTimeRemaining(null);
+    });
+    
+    socket.on('cancelled', (data) => {
+      showNotification('Image processing cancelled', 'info');
+      setIsProcessing(false);
+      setProcessingProgress(0);
+      setProcessingId(null);
+      setEstimatedTimeRemaining(null);
     });
     
     // Cleanup function
@@ -238,12 +292,28 @@ function App() {
     setIsProcessing(true);
     setProcessingProgress(0);
     setRecognitionResult(null);
+    setEstimatedTimeRemaining(null);
+    processingStartTimeRef.current = Date.now();
     
     if (socketRef.current && socketRef.current.connected) {
       socketRef.current.emit('process_image', {
         image: capturedImage,
         model: selectedModel
       });
+    }
+  };
+  
+  const cancelProcessing = () => {
+    if (!isProcessing || !processingId) {
+      return;
+    }
+    
+    if (socketRef.current && socketRef.current.connected) {
+      socketRef.current.emit('cancel_processing', {
+        processing_id: processingId
+      });
+      
+      // We'll wait for the 'cancelled' event to reset states
     }
   };
 
@@ -296,6 +366,19 @@ function App() {
       ...notification,
       open: false
     });
+  };
+
+  // Format the estimated time remaining
+  const formatTimeRemaining = (seconds) => {
+    if (!seconds || isNaN(seconds)) return '';
+    
+    if (seconds < 60) {
+      return `${seconds} sec remaining`;
+    } else {
+      const min = Math.floor(seconds / 60);
+      const sec = seconds % 60;
+      return `${min}:${sec.toString().padStart(2, '0')} remaining`;
+    }
   };
 
   return (
@@ -427,15 +510,26 @@ function App() {
                       >
                         Reset
                       </Button>
-                      <Button
-                        variant="contained"
-                        color="success"
-                        startIcon={<SendIcon />}
-                        onClick={processImage}
-                        disabled={!modelLoaded || isProcessing}
-                      >
-                        Analyze
-                      </Button>
+                      {!isProcessing ? (
+                        <Button
+                          variant="contained"
+                          color="success"
+                          startIcon={<SendIcon />}
+                          onClick={processImage}
+                          disabled={!modelLoaded}
+                        >
+                          Analyze
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="contained"
+                          color="error"
+                          startIcon={<CancelIcon />}
+                          onClick={cancelProcessing}
+                        >
+                          Cancel
+                        </Button>
+                      )}
                     </>
                   )}
                 </Box>
@@ -526,10 +620,18 @@ function App() {
                         <LinearProgress 
                           variant="determinate" 
                           value={processingProgress} 
+                          color={processingProgress < 30 ? "secondary" : processingProgress < 70 ? "primary" : "success"}
                         />
-                        <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                          {processingProgress}% complete
-                        </Typography>
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', mt: 1 }}>
+                          <Typography variant="body2" color="text.secondary">
+                            {processingProgress}% complete
+                          </Typography>
+                          {estimatedTimeRemaining && (
+                            <Typography variant="body2" color="text.secondary">
+                              {formatTimeRemaining(estimatedTimeRemaining)}
+                            </Typography>
+                          )}
+                        </Box>
                       </Box>
                     )}
                   </Box>
@@ -610,5 +712,4 @@ function App() {
     </ThemeProvider>
   );
 }
-
 export default App;

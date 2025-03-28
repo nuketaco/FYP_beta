@@ -1,58 +1,93 @@
+#!/usr/bin/env python
+# --- IMPORTANT: Monkey patch MUST be done first, before any other imports ---
 import eventlet
 eventlet.monkey_patch()
+
+# --- Standard library imports ---
 import os
 import sys
 import json
 import base64
 import time
-import asyncio
 import threading
 import subprocess
-import glob
-from pathlib import Path
+import uuid
 from io import BytesIO
+from pathlib import Path
 from typing import List, Dict, Any, Optional
+from transformers import BitsAndBytesConfig
 
+# --- Flask and related imports ---
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
+import logging
+
+# --- Create app and configure Socket.IO before other imports ---
+app = Flask(__name__, static_folder='./client/build')
+CORS(app)
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    async_mode='eventlet',
+    ping_timeout=60,
+    ping_interval=25
+)
+
+# --- ML-related imports ---
+# These come after Flask and Socket.IO setup to avoid context issues
 from PIL import Image
 import torch
-from transformers import AutoProcessor, AutoModelForVision2Seq
 
-# Configuration
+# --- Configuration constants ---
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "uploads")
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif"}
+VRAM_LIMIT = 8.5 * 1024 * 1024 * 1024  # 8GB in bytes
 
 # Create directories if they don't exist
 os.makedirs(MODEL_DIR, exist_ok=True)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-app = Flask(__name__, static_folder='./client/build')
-CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*")
+# --- Setup logging ---
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-eventlet.monkey_patch()
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# --- Global state management ---
+class AppState:
+    def __init__(self):
+        self.loaded_model = None
+        self.loaded_processor = None
+        self.current_model_name = None
+        self.model_loading = False
+        self.active_processing_tasks = {}  # Map of processing_id -> cancel_flag
+        
+        # Check if CUDA is available
+        self.cuda_available = torch.cuda.is_available()
+        self.device = torch.device("cuda" if self.cuda_available else "cpu")
+        
+        if self.cuda_available:
+            try:
+                gpu_name = torch.cuda.get_device_name(0)
+                vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                logger.info(f"GPU: {gpu_name} with {vram:.2f} GB VRAM")
+            except Exception as e:
+                logger.warning(f"Error getting GPU info: {e}")
 
-# Global variables
-loaded_model = None
-loaded_processor = None
-current_model_name = None
-model_loading = False
+# Initialize state
+state = AppState()
 
-# Check if CUDA is available
-cuda_available = torch.cuda.is_available()
-device = torch.device("cuda" if cuda_available else "cpu")
-vram_limit = 8 * 1024 * 1024 * 1024  # 8GB in bytes
-
+# --- Helper functions ---
 def get_available_models() -> List[str]:
     """Get list of available models in the models directory."""
-    model_dirs = [d for d in os.listdir(MODEL_DIR) 
-                 if os.path.isdir(os.path.join(MODEL_DIR, d))]
-    
-    return model_dirs
+    try:
+        model_dirs = [d for d in os.listdir(MODEL_DIR) 
+                    if os.path.isdir(os.path.join(MODEL_DIR, d))]
+        return model_dirs
+    except Exception as e:
+        logger.error(f"Error getting available models: {e}")
+        return []
 
 def allowed_file(filename: str) -> bool:
     """Check if the file extension is allowed."""
@@ -74,17 +109,28 @@ def preprocess_image(image_data: str) -> Image.Image:
         
     return image
 
+def cancel_processing(processing_id: str) -> bool:
+    """Cancel an in-progress image processing task."""
+    if processing_id not in state.active_processing_tasks:
+        return False
+    
+    # Set the cancel flag
+    state.active_processing_tasks[processing_id]['cancelled'] = True
+    return True
+
+# --- Model management functions ---
 def load_model(model_name: str) -> Dict[str, Any]:
     """Load a model from the models directory."""
-    global loaded_model, loaded_processor, current_model_name, model_loading
-    
-    if model_loading:
+    if state.model_loading:
         return {"success": False, "message": "Another model is currently loading"}
     
-    model_loading = True
-    current_model_name = model_name
+    state.model_loading = True
+    state.current_model_name = model_name
     
     try:
+        # Import here to avoid circular imports with monkey patching
+        from transformers import AutoProcessor, AutoModelForVision2Seq
+        
         # Send initial progress update
         socketio.emit('model_status', {
             'type': 'model_status',
@@ -108,11 +154,14 @@ def load_model(model_name: str) -> Dict[str, Any]:
         
         # Load processor
         try:
-            loaded_processor = AutoProcessor.from_pretrained(
+            state.loaded_processor = AutoProcessor.from_pretrained(
                 model_path,
-                trust_remote_code=True
+                trust_remote_code=True,
+                use_fast=True
+                
             )
         except Exception as e:
+            logger.error(f"Error loading processor: {e}")
             return {"success": False, "message": f"Error loading processor: {str(e)}"}
         
         # Progress update - 30%
@@ -126,13 +175,13 @@ def load_model(model_name: str) -> Dict[str, Any]:
         # Determine if we can fit in VRAM or need CPU offloading
         use_device_map = "auto"  # Default to auto for best performance
         
-        if cuda_available:
+        if state.cuda_available:
             # Check available VRAM
             total_vram = torch.cuda.get_device_properties(0).total_memory
-            if total_vram <= vram_limit:
+            if total_vram <= VRAM_LIMIT:
                 # Use CPU offloading if VRAM is limited
                 use_device_map = {"": "cpu"}
-                print(f"Limited VRAM detected ({total_vram / 1e9:.2f} GB). Using CPU offloading.")
+                logger.info(f"Limited VRAM detected ({total_vram / 1e9:.2f} GB). Using CPU offloading.")
         
         # Progress update - 50%
         socketio.emit('model_status', {
@@ -142,17 +191,20 @@ def load_model(model_name: str) -> Dict[str, Any]:
             'progress': 50
         })
         
+        
         # Load model with appropriate settings
         try:
-            loaded_model = AutoModelForVision2Seq.from_pretrained(
+            state.loaded_model = AutoModelForVision2Seq.from_pretrained(
                 model_path,
-                torch_dtype=torch.float16 if cuda_available else torch.float32,
+                torch_dtype=torch.float16 if state.cuda_available else torch.float32,
+                device_map="auto",
+                load_in_8bit=True,  # Use 8-bit quantization
                 low_cpu_mem_usage=True,
-                device_map=use_device_map,
                 trust_remote_code=True
             )
         except Exception as e:
-            loaded_processor = None  # Clean up if model loading fails
+            state.loaded_processor = None  # Clean up if model loading fails
+            logger.error(f"Error loading model: {e}")
             return {"success": False, "message": f"Error loading model: {str(e)}"}
         
         # Progress updates 70% -> 100%
@@ -162,102 +214,187 @@ def load_model(model_name: str) -> Dict[str, Any]:
                 'name': model_name,
                 'loaded': progress == 100,
                 'progress': progress,
-                'cuda_available': cuda_available
+                'cuda_available': state.cuda_available
             })
-            time.sleep(0.2)  # Small delay for visual feedback
+            eventlet.sleep(0.2)  # Small delay for visual feedback, using eventlet.sleep
         
         return {"success": True, "message": f"Model {model_name} loaded successfully"}
     
     except Exception as e:
+        logger.error(f"Unexpected error loading model: {e}")
         return {"success": False, "message": f"Error loading model: {str(e)}"}
     
     finally:
-        model_loading = False
+        state.model_loading = False
 
 def unload_model() -> Dict[str, Any]:
     """Unload the currently loaded model."""
-    global loaded_model, loaded_processor, current_model_name
-    
-    if loaded_model is None:
+    if state.loaded_model is None:
         return {"success": False, "message": "No model is currently loaded"}
     
     try:
         # Release CUDA memory if using GPU
-        if cuda_available and hasattr(loaded_model, 'to'):
-            loaded_model.to('cpu')
+        if state.cuda_available and hasattr(state.loaded_model, 'to'):
+            state.loaded_model.to('cpu')
             torch.cuda.empty_cache()
         
-        loaded_model = None
-        loaded_processor = None
-        model_name = current_model_name
-        current_model_name = None
+        model_name = state.current_model_name
+        state.loaded_model = None
+        state.loaded_processor = None
+        state.current_model_name = None
         
         return {"success": True, "message": f"Model {model_name} unloaded successfully"}
     
     except Exception as e:
+        logger.error(f"Error unloading model: {e}")
         return {"success": False, "message": f"Error unloading model: {str(e)}"}
 
-def process_image(image: Image.Image) -> str:
-    """Process an image with the loaded model."""
-    global loaded_model, loaded_processor
+def update_progress(step, output, processing_id, cancel_flag):
+    """Update progress during model generation and check for cancellation."""
+    max_steps = 100  # Typical model generation steps
+    progress = min(int((step / max_steps) * 100), 75)  # Cap at 75% for generation phase
     
-    if loaded_model is None or loaded_processor is None:
+    # Emit progress update every few steps to avoid flooding
+    if step % 5 == 0 or step == 1:
+        socketio.emit('processing', {
+            'type': 'processing',
+            'progress': progress,
+            'processing_id': processing_id
+        })
+    
+    # Check if this task has been cancelled
+    return cancel_flag['cancelled']
+
+
+def resize_image_for_processing(image, max_size=512):
+    """Resize an image to limit maximum dimension while preserving aspect ratio."""
+    width, height = image.size
+    if width <= max_size and height <= max_size:
+        return image  # No need to resize
+    
+    # Calculate new dimensions
+    if width > height:
+        new_width = max_size
+        new_height = int(height * (max_size / width))
+    else:
+        new_height = max_size
+        new_width = int(width * (max_size / height))
+    
+    # Resize and return
+    resized_image = image.resize((new_width, new_height), Image.LANCZOS)
+    logger.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
+    return resized_image
+
+def process_image(image: Image.Image, processing_id: str) -> str:
+    """Process an image with the loaded model."""
+    if state.loaded_model is None or state.loaded_processor is None:
         return "Error: No model is loaded"
     
+    # Initialize a flag for this processing task
+    cancel_flag = {'cancelled': False}
+    state.active_processing_tasks[processing_id] = cancel_flag
+    
     try:
+        # clear cuda cache before processing
+        if state.cuda_available:
+            torch.cuda.empty_cache()
         # Generate a text prompt
         prompt = "Describe what you see in this image in detail."
         
         # Prepare the image and prompt for the model
-        inputs = loaded_processor(images=image, text=prompt, return_tensors="pt")
+        image = resize_image_for_processing(image, max_size=512)
+        
+        inputs = state.loaded_processor(images=image, text=prompt, return_tensors="pt")
         
         # Move input tensors to the correct device
         for k, v in inputs.items():
-            if hasattr(v, 'to') and cuda_available:
-                inputs[k] = v.to(device)
+            if hasattr(v, 'to') and state.cuda_available:
+                inputs[k] = v.to(state.device)
         
         # Send initial progress update for processing
         socketio.emit('processing', {
             'type': 'processing',
-            'progress': 10
+            'progress': 10,
+            'processing_id': processing_id
         })
+        
+        # Check if cancelled before generation
+        if cancel_flag['cancelled']:
+            return "Processing cancelled by user"
         
         # Generate prediction
         with torch.no_grad():
-            # Model inference
-            output_ids = loaded_model.generate(
-                **inputs,
-                max_length=512,
-                do_sample=False
-            )
+            # Model inference with progress updates
+            # Note: For some models, the callback may not be supported
+            try:
+                output_ids = state.loaded_model.generate(
+                    **inputs,
+                    max_length=512,
+                    do_sample=False,
+                    batch_size=1,
+                    callback=lambda step, output, params: update_progress(step, output, processing_id, cancel_flag)
+                )
+            except TypeError:
+                # Fallback if callback is not supported
+                logger.info("Model doesn't support callback, using simple generation")
+                # Emit progress updates manually
+                socketio.emit('processing', {
+                    'type': 'processing',
+                    'progress': 25,
+                    'processing_id': processing_id
+                })
+                
+                output_ids = state.loaded_model.generate(
+                    **inputs,
+                    max_length=512,
+                    do_sample=False
+                )
+                
+                socketio.emit('processing', {
+                    'type': 'processing',
+                    'progress': 50,
+                    'processing_id': processing_id
+                })
             
             # Update progress during generation
             socketio.emit('processing', {
                 'type': 'processing',
-                'progress': 75
+                'progress': 75,
+                'processing_id': processing_id
             })
+            
+            # Check if cancelled after generation
+            if cancel_flag['cancelled']:
+                return "Processing cancelled by user"
         
         # Send final progress update
         socketio.emit('processing', {
             'type': 'processing',
-            'progress': 100
+            'progress': 100,
+            'processing_id': processing_id
         })
         
         # Decode the output ids to text
-        if hasattr(loaded_processor, 'batch_decode'):
-            result = loaded_processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+        if hasattr(state.loaded_processor, 'batch_decode'):
+            result = state.loaded_processor.batch_decode(output_ids, skip_special_tokens=True)[0]
         else:
             # Fallback for models without batch_decode
             from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_DIR, current_model_name))
+            tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_DIR, state.current_model_name))
             result = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         
         return result
     
     except Exception as e:
+        logger.error(f"Error processing image: {e}")
         return f"Error processing image: {str(e)}"
+    
+    finally:
+        # Remove from active tasks
+        if processing_id in state.active_processing_tasks:
+            del state.active_processing_tasks[processing_id]
 
-# Flask routes
+# --- Flask routes ---
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve(path):
@@ -282,8 +419,17 @@ def api_load_model():
     if not model_name:
         return jsonify({"success": False, "message": "Model name is required"})
     
-    result = load_model(model_name)
-    return jsonify(result)
+    # Start model loading in a separate thread to not block the server
+    def load_model_thread():
+        result = load_model(model_name)
+        if not result["success"]:
+            logger.error(f"Error loading model: {result['message']}")
+    
+    thread = threading.Thread(target=load_model_thread)
+    thread.daemon = True
+    thread.start()
+    
+    return jsonify({"success": True, "message": f"Loading model {model_name}..."})
 
 @app.route("/api/model/unload", methods=["POST"])
 def api_unload_model():
@@ -299,33 +445,81 @@ def api_process_image():
     
     try:
         image_data = request.json["image"]
+        processing_id = str(uuid.uuid4())
         image = preprocess_image(image_data)
         
-        result = process_image(image)
+        # Start processing in a separate thread
+        def process_thread():
+            try:
+                result = process_image(image, processing_id)
+                
+                # Check if processing was cancelled
+                if result == "Processing cancelled by user":
+                    return
+                
+                # Send result
+                socketio.emit("result", {
+                    "type": "result",
+                    "result": result,
+                    "processing_id": processing_id
+                })
+            except Exception as e:
+                logger.error(f" critical Error in process thread: {e}", exc_info=True)
+                
+                try:
+                    socketio.emit("error", {
+                        "type": "error",
+                        "message": f"Error processing image: {str(e)}",
+                        "processing_id": processing_id
+                })
+                except:
+                    logger.error("could not notify client of error")
+        
+        thread = threading.Thread(target=process_thread)
+        thread.daemon = True
+        thread.start()
         
         return jsonify({
             "success": True,
-            "result": result
+            "message": "Processing started",
+            "processing_id": processing_id
         })
     
     except Exception as e:
+        logger.error(f"API process error: {e}")
         return jsonify({
             "success": False,
             "message": f"Error processing image: {str(e)}"
         })
 
-# Socket.IO event handlers
+@app.route("/api/cancel", methods=["POST"])
+def api_cancel_processing():
+    """API endpoint to cancel image processing."""
+    data = request.json
+    processing_id = data.get("processing_id")
+    
+    if not processing_id:
+        return jsonify({"success": False, "message": "Processing ID is required"})
+    
+    result = cancel_processing(processing_id)
+    
+    return jsonify({
+        "success": result,
+        "message": "Processing cancelled" if result else "No active processing found with this ID"
+    })
+
+# --- Socket.IO event handlers ---
 @socketio.on("connect")
 def handle_connect():
     """Handle client connection."""
-    print("Client connected")
+    logger.info("Client connected")
     models = get_available_models()
     emit("models", {"type": "models", "models": models})
 
 @socketio.on("disconnect")
 def handle_disconnect():
     """Handle client disconnection."""
-    print("Client disconnected")
+    logger.info("Client disconnected")
 
 @socketio.on("get_models")
 def handle_get_models():
@@ -354,7 +548,9 @@ def handle_load_model(data):
                 "message": result["message"]
             })
     
-    threading.Thread(target=load_model_thread).start()
+    thread = threading.Thread(target=load_model_thread)
+    thread.daemon = True
+    thread.start()
     
     emit("model_status", {
         "type": "model_status",
@@ -391,7 +587,7 @@ def handle_process_image(data):
         })
         return
     
-    if loaded_model is None or loaded_processor is None:
+    if state.loaded_model is None or state.loaded_processor is None:
         emit("error", {
             "type": "error",
             "message": "No model is loaded"
@@ -402,36 +598,89 @@ def handle_process_image(data):
         image_data = data["image"]
         image = preprocess_image(image_data)
         
+        # Generate a unique ID for this processing task
+        processing_id = str(uuid.uuid4())
+        
         # Start processing in a separate thread
         def process_thread():
             try:
-                # Send processing status
+                # Send processing status with the processing ID
                 socketio.emit("processing", {
                     "type": "processing",
-                    "progress": 10
+                    "progress": 5,
+                    "processing_id": processing_id
                 })
                 
                 # Process the image
-                result = process_image(image)
+                result = process_image(image, processing_id)
+                
+                # Check if processing was cancelled
+                if result == "Processing cancelled by user":
+                    socketio.emit("cancelled", {
+                        "type": "cancelled",
+                        "processing_id": processing_id
+                    })
+                    return
                 
                 # Send result
                 socketio.emit("result", {
                     "type": "result",
-                    "result": result
+                    "result": result,
+                    "processing_id": processing_id
                 })
             
             except Exception as e:
+                logger.error(f"Socket process error: {e}")
                 socketio.emit("error", {
                     "type": "error",
-                    "message": f"Error processing image: {str(e)}"
+                    "message": f"Error processing image: {str(e)}",
+                    "processing_id": processing_id
                 })
         
-        threading.Thread(target=process_thread).start()
+        thread = threading.Thread(target=process_thread)
+        thread.daemon = True
+        thread.start()
+        
+        # Send the processing ID to the client immediately
+        emit("processing", {
+            "type": "processing",
+            "progress": 0,
+            "processing_id": processing_id,
+            "message": "Starting image processing..."
+        })
         
     except Exception as e:
+        logger.error(f"Socket image processing error: {e}")
         emit("error", {
             "type": "error",
             "message": f"Error processing image: {str(e)}"
+        })
+
+@socketio.on("cancel_processing")
+def handle_cancel_processing(data):
+    """Handle request to cancel image processing."""
+    processing_id = data.get("processing_id")
+    
+    if not processing_id:
+        emit("error", {
+            "type": "error",
+            "message": "Processing ID is required"
+        })
+        return
+    
+    result = cancel_processing(processing_id)
+    
+    if result:
+        emit("processing", {
+            "type": "processing",
+            "progress": 0,
+            "processing_id": processing_id,
+            "message": "Cancelling processing..."
+        })
+    else:
+        emit("error", {
+            "type": "error",
+            "message": "No active processing found with this ID"
         })
 
 def setup_localhost_run(port=5000):
@@ -448,62 +697,58 @@ def setup_localhost_run(port=5000):
         )
         
         # Print command to start the tunnel
-        print(f"Starting localhost.run tunnel with command: {cmd}")
-        print("This will create a HTTPS tunnel to your local app.")
-        print("Look for a URL in the format https://[random]-localhost.run")
+        logger.info(f"Starting localhost.run tunnel with command: {cmd}")
+        logger.info("This will create a HTTPS tunnel to your local app.")
+        logger.info("Look for a URL in the format https://[random]-localhost.run")
         
         # Read and print the output to find the URL
         while True:
             line = process.stdout.readline()
             if not line:
                 break
-            print(line.strip())
+            logger.info(line.strip())
             
             # Look for the URL in the output
             if "tunneled with tls termination" in line:
-                print("\n" + "="*50)
-                print("HTTPS TUNNEL ACTIVE")
-                print("Copy the URL above and open it in your mobile browser")
-                print("="*50 + "\n")
+                logger.info("\n" + "="*50)
+                logger.info("HTTPS TUNNEL ACTIVE")
+                logger.info("Copy the URL above and open it in your mobile browser")
+                logger.info("="*50 + "\n")
         
         return process
     
     except Exception as e:
-        print(f"Error setting up localhost.run: {e}")
+        logger.error(f"Error setting up localhost.run: {e}")
         return None
 
+# --- Main entry point ---
 if __name__ == "__main__":
     # Check for command line arguments
     port = 5000
     use_tunnel = "--tunnel" in sys.argv
     
-    print(f"Starting Flask server on port {port}")
-    print(f"CUDA available: {cuda_available}")
-    
-    if cuda_available:
-        gpu_name = torch.cuda.get_device_name(0)
-        vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
-        print(f"GPU: {gpu_name} with {vram:.2f} GB VRAM")
+    logger.info(f"Starting Flask server on port {port}")
+    logger.info(f"CUDA available: {state.cuda_available}")
     
     # Display available models
     models = get_available_models()
     if models:
-        print(f"Available models: {', '.join(models)}")
+        logger.info(f"Available models: {', '.join(models)}")
     else:
-        print("No models found in the models directory. Please add models to:", MODEL_DIR)
+        logger.info(f"No models found in the models directory. Please add models to: {MODEL_DIR}")
     
     # Start localhost.run tunnel if requested
     tunnel_process = None
     if use_tunnel:
-        print("Setting up localhost.run tunnel for HTTPS access...")
+        logger.info("Setting up localhost.run tunnel for HTTPS access...")
         tunnel_process = setup_localhost_run(port)
     
     try:
         # Start the Flask app
-        socketio.run(app, host="0.0.0.0", port=port, debug=True, allow_unsafe_werkzeug=True)
+        socketio.run(app, host="0.0.0.0", port=port, debug=False, allow_unsafe_werkzeug=True)
     
     finally:
         # Clean up
         if tunnel_process:
             tunnel_process.terminate()
-            print("Localhost.run tunnel terminated")
+            logger.info("Localhost.run tunnel terminated")
