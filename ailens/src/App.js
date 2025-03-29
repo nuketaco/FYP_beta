@@ -53,6 +53,7 @@ function App() {
   const [selectedCamera, setSelectedCamera] = useState('');
   const [processingId, setProcessingId] = useState(null);
   const [estimatedTimeRemaining, setEstimatedTimeRemaining] = useState(null);
+  const [progressInterval, setProgressIntervalState] = useState(null);
   
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -76,9 +77,29 @@ function App() {
       showNotification('This app works best with HTTPS to access camera features.', 'warning');
     }
 
+    // Test server reachability
+    fetch('/api/models')
+      .then(response => {
+        console.log('Server is reachable!', response);
+        if (!response.ok) {
+          throw new Error('Server returned an error response');
+        }
+        return response.json();
+      })
+      .then(data => {
+        console.log('Models available:', data);
+        if (data.models && data.models.length > 0) {
+          setAvailableModels(data.models);
+          setSelectedModel(data.models[0]);
+        }
+      })
+      .catch(error => {
+        console.error('Error reaching server:', error);
+        showNotification('Error connecting to server. Please check if the backend is running.', 'error');
+      });
+
     // Establish Socket.IO connection
-    const socket = io({
-      path: '/socket.io',
+    const socket = io('http://localhost:5000', {
       reconnection: true,
       reconnectionAttempts: 10,
       reconnectionDelay: 1000,
@@ -176,6 +197,9 @@ function App() {
       if (socketRef.current) {
         socketRef.current.disconnect();
       }
+      if (progressInterval) {
+        clearInterval(progressInterval);
+      }
       stopCamera();
     };
   }, []);
@@ -209,6 +233,22 @@ function App() {
   const fetchAvailableModels = () => {
     if (socketRef.current && socketRef.current.connected) {
       socketRef.current.emit('get_models');
+    } else {
+      // Fallback to REST API if socket isn't connected
+      fetch('/api/models')
+        .then(response => response.json())
+        .then(data => {
+          if (data.models) {
+            setAvailableModels(data.models);
+            if (data.models.length > 0) {
+              setSelectedModel(data.models[0]);
+            }
+          }
+        })
+        .catch(error => {
+          console.error('Error fetching models:', error);
+          showNotification('Error fetching available models', 'error');
+        });
     }
   };
 
@@ -284,7 +324,7 @@ function App() {
   };
 
   const processImage = () => {
-    if (!capturedImage || !isConnected || !modelLoaded) {
+    if (!capturedImage || !modelLoaded) {
       showNotification('Please capture an image and ensure model is loaded', 'warning');
       return;
     }
@@ -295,25 +335,83 @@ function App() {
     setEstimatedTimeRemaining(null);
     processingStartTimeRef.current = Date.now();
     
-    if (socketRef.current && socketRef.current.connected) {
-      socketRef.current.emit('process_image', {
+    // Set up progress simulation
+    let progress = 10;
+    if (progressInterval) {
+      clearInterval(progressInterval);
+    }
+    const interval = setInterval(() => {
+      progress += 5;
+      if (progress >= 90) {
+        clearInterval(interval);
+      }
+      setProcessingProgress(progress);
+    }, 500);
+    setProgressIntervalState(interval);
+    
+    // Use REST API instead of Socket.IO for processing
+    fetch('/api/process-image-v2', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
         image: capturedImage,
         model: selectedModel
-      });
-    }
+      }),
+    })
+    .then(response => {
+      if (!response.ok) {
+        throw new Error(`HTTP error! Status: ${response.status}`);
+      }
+      setProcessingProgress(100); // Done
+      return response.json();
+    })
+    .then(data => {
+      if (data.success) {
+        setRecognitionResult(data.result);
+        showNotification('Image recognition complete!', 'success');
+      } else {
+        showNotification(data.message || 'Processing failed', 'error');
+      }
+    })
+    .catch(error => {
+      console.error('Error processing image:', error);
+      showNotification(`Error: ${error.message}`, 'error');
+    })
+    .finally(() => {
+      if (progressInterval) {
+        clearInterval(progressInterval);
+      }
+      setProcessingProgress(100);
+      setTimeout(() => {
+        setIsProcessing(false);
+        setProcessingId(null);
+        setEstimatedTimeRemaining(null);
+      }, 500); // Give a moment to show 100%
+    });
   };
   
   const cancelProcessing = () => {
-    if (!isProcessing || !processingId) {
+    if (!isProcessing) {
       return;
     }
     
-    if (socketRef.current && socketRef.current.connected) {
+    // Clear the progress simulation interval
+    if (progressInterval) {
+      clearInterval(progressInterval);
+    }
+    
+    // If we have a processing ID, try to cancel via Socket.IO
+    if (processingId && socketRef.current && socketRef.current.connected) {
       socketRef.current.emit('cancel_processing', {
         processing_id: processingId
       });
-      
-      // We'll wait for the 'cancelled' event to reset states
+    } else {
+      // Otherwise just reset the UI
+      setIsProcessing(false);
+      setProcessingProgress(0);
+      setProcessingId(null);
+      setEstimatedTimeRemaining(null);
+      showNotification('Processing cancelled', 'info');
     }
   };
 
@@ -329,7 +427,57 @@ function App() {
       socketRef.current.emit('load_model', {
         model: selectedModel
       });
+    } else {
+      // Fallback to REST API if socket isn't connected
+      fetch('/api/model/load', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: selectedModel
+        }),
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          // Since we can't get progress updates without socket, show a notification
+          showNotification(`Started loading model ${selectedModel}`, 'info');
+          // We'll need to poll for model status
+          checkModelLoadingStatus();
+        } else {
+          showNotification(data.message || 'Failed to load model', 'error');
+        }
+      })
+      .catch(error => {
+        console.error('Error loading model:', error);
+        showNotification(`Error loading model: ${error.message}`, 'error');
+      });
     }
+  };
+
+  const checkModelLoadingStatus = () => {
+    // Poll the server every 2 seconds to check model loading status
+    const checkInterval = setInterval(() => {
+      fetch('/api/models')
+        .then(response => response.json())
+        .then(data => {
+          // If we got a valid response, assume the model is loaded
+          setModelLoaded(true);
+          setLoadingProgress(100);
+          showNotification(`Model ${selectedModel} loaded successfully`, 'success');
+          clearInterval(checkInterval);
+        })
+        .catch(error => {
+          console.error('Error checking model status:', error);
+          // Keep trying
+        });
+    }, 2000);
+    
+    // Stop checking after 60 seconds
+    setTimeout(() => {
+      clearInterval(checkInterval);
+    }, 60000);
   };
 
   const unloadModel = () => {
@@ -342,6 +490,28 @@ function App() {
       socketRef.current.emit('unload_model');
       setModelLoaded(false);
       showNotification('Model unloaded from GPU', 'info');
+    } else {
+      // Fallback to REST API
+      fetch('/api/model/unload', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({}),
+      })
+      .then(response => response.json())
+      .then(data => {
+        if (data.success) {
+          setModelLoaded(false);
+          showNotification('Model unloaded from GPU', 'success');
+        } else {
+          showNotification(data.message || 'Failed to unload model', 'error');
+        }
+      })
+      .catch(error => {
+        console.error('Error unloading model:', error);
+        showNotification(`Error unloading model: ${error.message}`, 'error');
+      });
     }
   };
 
@@ -712,4 +882,5 @@ function App() {
     </ThemeProvider>
   );
 }
+
 export default App;

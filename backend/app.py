@@ -15,7 +15,6 @@ import uuid
 from io import BytesIO
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from transformers import BitsAndBytesConfig
 
 # --- Flask and related imports ---
 from flask import Flask, request, jsonify, send_from_directory
@@ -25,7 +24,7 @@ import logging
 
 # --- Create app and configure Socket.IO before other imports ---
 app = Flask(__name__, static_folder='./client/build')
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 socketio = SocketIO(
     app, 
     cors_allowed_origins="*", 
@@ -43,7 +42,7 @@ import torch
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), "uploads")
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif"}
-VRAM_LIMIT = 8.5 * 1024 * 1024 * 1024  # 8GB in bytes
+VRAM_LIMIT = 8.5 * 1024 * 1024 * 1024  # 8.5GB in bytes
 
 # Create directories if they don't exist
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -84,6 +83,8 @@ def get_available_models() -> List[str]:
     try:
         model_dirs = [d for d in os.listdir(MODEL_DIR) 
                     if os.path.isdir(os.path.join(MODEL_DIR, d))]
+        logger.info(f"Looking for models in: {os.path.abspath(MODEL_DIR)}")
+        logger.info(f"Found models: {model_dirs}")
         return model_dirs
     except Exception as e:
         logger.error(f"Error getting available models: {e}")
@@ -109,6 +110,30 @@ def preprocess_image(image_data: str) -> Image.Image:
         
     return image
 
+def resize_image_for_processing(image, max_size=512):
+    """Resize an image to limit maximum dimension while preserving aspect ratio."""
+    width, height = image.size
+    if width <= max_size and height <= max_size:
+        return image  # No need to resize
+    
+    # Calculate new dimensions
+    if width > height:
+        new_width = max_size
+        new_height = int(height * (max_size / width))
+    else:
+        new_height = max_size
+        new_width = int(width * (max_size / height))
+    
+    # Resize and return
+    try:
+        resized_image = image.resize((new_width, new_height), Image.LANCZOS)
+    except AttributeError:
+        # Fallback for older Pillow versions that might not have LANCZOS
+        resized_image = image.resize((new_width, new_height), Image.ANTIALIAS)
+    
+    logger.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
+    return resized_image
+
 def cancel_processing(processing_id: str) -> bool:
     """Cancel an in-progress image processing task."""
     if processing_id not in state.active_processing_tasks:
@@ -120,7 +145,7 @@ def cancel_processing(processing_id: str) -> bool:
 
 # --- Model management functions ---
 def load_model(model_name: str) -> Dict[str, Any]:
-    """Load a model from the models directory."""
+    """Load a ResNet model for image recognition."""
     if state.model_loading:
         return {"success": False, "message": "Another model is currently loading"}
     
@@ -128,8 +153,8 @@ def load_model(model_name: str) -> Dict[str, Any]:
     state.current_model_name = model_name
     
     try:
-        # Import here to avoid circular imports with monkey patching
-        from transformers import AutoProcessor, AutoModelForVision2Seq
+        # Import the necessary libraries
+        from transformers import AutoFeatureExtractor, ResNetForImageClassification
         
         # Send initial progress update
         socketio.emit('model_status', {
@@ -152,17 +177,12 @@ def load_model(model_name: str) -> Dict[str, Any]:
             'progress': 10
         })
         
-        # Load processor
+        # Load feature extractor (processor)
         try:
-            state.loaded_processor = AutoProcessor.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-                use_fast=True
-                
-            )
+            state.loaded_processor = AutoFeatureExtractor.from_pretrained(model_path)
         except Exception as e:
-            logger.error(f"Error loading processor: {e}")
-            return {"success": False, "message": f"Error loading processor: {str(e)}"}
+            logger.error(f"Error loading feature extractor: {e}")
+            return {"success": False, "message": f"Error loading feature extractor: {str(e)}"}
         
         # Progress update - 30%
         socketio.emit('model_status', {
@@ -172,17 +192,6 @@ def load_model(model_name: str) -> Dict[str, Any]:
             'progress': 30
         })
         
-        # Determine if we can fit in VRAM or need CPU offloading
-        use_device_map = "auto"  # Default to auto for best performance
-        
-        if state.cuda_available:
-            # Check available VRAM
-            total_vram = torch.cuda.get_device_properties(0).total_memory
-            if total_vram <= VRAM_LIMIT:
-                # Use CPU offloading if VRAM is limited
-                use_device_map = {"": "cpu"}
-                logger.info(f"Limited VRAM detected ({total_vram / 1e9:.2f} GB). Using CPU offloading.")
-        
         # Progress update - 50%
         socketio.emit('model_status', {
             'type': 'model_status', 
@@ -191,19 +200,23 @@ def load_model(model_name: str) -> Dict[str, Any]:
             'progress': 50
         })
         
-        
-        # Load model with appropriate settings
+        # Load model with memory-efficient settings
         try:
-            state.loaded_model = AutoModelForVision2Seq.from_pretrained(
+            state.loaded_model = ResNetForImageClassification.from_pretrained(
                 model_path,
-                torch_dtype=torch.float16 if state.cuda_available else torch.float32,
-                device_map="auto",
-                load_in_8bit=True,  # Use 8-bit quantization
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
+                torch_dtype=torch.float32,  # Use float32 for better compatibility
+                low_cpu_mem_usage=True
             )
+            
+            # Move to CPU to start - we'll move specific operations to GPU as needed
+            state.loaded_model.to("cpu")
+            
+            # Clear GPU memory
+            if state.cuda_available:
+                torch.cuda.empty_cache()
+            
         except Exception as e:
-            state.loaded_processor = None  # Clean up if model loading fails
+            state.loaded_processor = None
             logger.error(f"Error loading model: {e}")
             return {"success": False, "message": f"Error loading model: {str(e)}"}
         
@@ -216,9 +229,9 @@ def load_model(model_name: str) -> Dict[str, Any]:
                 'progress': progress,
                 'cuda_available': state.cuda_available
             })
-            eventlet.sleep(0.2)  # Small delay for visual feedback, using eventlet.sleep
+            eventlet.sleep(0.2)
         
-        return {"success": True, "message": f"Model {model_name} loaded successfully"}
+        return {"success": True, "message": f"ResNet model {model_name} loaded successfully"}
     
     except Exception as e:
         logger.error(f"Unexpected error loading model: {e}")
@@ -265,26 +278,6 @@ def update_progress(step, output, processing_id, cancel_flag):
     # Check if this task has been cancelled
     return cancel_flag['cancelled']
 
-
-def resize_image_for_processing(image, max_size=512):
-    """Resize an image to limit maximum dimension while preserving aspect ratio."""
-    width, height = image.size
-    if width <= max_size and height <= max_size:
-        return image  # No need to resize
-    
-    # Calculate new dimensions
-    if width > height:
-        new_width = max_size
-        new_height = int(height * (max_size / width))
-    else:
-        new_height = max_size
-        new_width = int(width * (max_size / height))
-    
-    # Resize and return
-    resized_image = image.resize((new_width, new_height), Image.LANCZOS)
-    logger.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
-    return resized_image
-
 def process_image(image: Image.Image, processing_id: str) -> str:
     """Process an image with the loaded model."""
     if state.loaded_model is None or state.loaded_processor is None:
@@ -295,15 +288,17 @@ def process_image(image: Image.Image, processing_id: str) -> str:
     state.active_processing_tasks[processing_id] = cancel_flag
     
     try:
-        # clear cuda cache before processing
+        # Clear CUDA cache before processing
         if state.cuda_available:
             torch.cuda.empty_cache()
+            
+        # Resize image to reduce memory usage
+        image = resize_image_for_processing(image, max_size=512)
+        
         # Generate a text prompt
         prompt = "Describe what you see in this image in detail."
         
         # Prepare the image and prompt for the model
-        image = resize_image_for_processing(image, max_size=512)
-        
         inputs = state.loaded_processor(images=image, text=prompt, return_tensors="pt")
         
         # Move input tensors to the correct device
@@ -329,9 +324,8 @@ def process_image(image: Image.Image, processing_id: str) -> str:
             try:
                 output_ids = state.loaded_model.generate(
                     **inputs,
-                    max_length=512,
+                    max_new_tokens=256,  # Reduced token count
                     do_sample=False,
-                    batch_size=1,
                     callback=lambda step, output, params: update_progress(step, output, processing_id, cancel_flag)
                 )
             except TypeError:
@@ -346,7 +340,7 @@ def process_image(image: Image.Image, processing_id: str) -> str:
                 
                 output_ids = state.loaded_model.generate(
                     **inputs,
-                    max_length=512,
+                    max_new_tokens=256,
                     do_sample=False
                 )
                 
@@ -383,6 +377,10 @@ def process_image(image: Image.Image, processing_id: str) -> str:
             tokenizer = AutoTokenizer.from_pretrained(os.path.join(MODEL_DIR, state.current_model_name))
             result = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         
+        # Clear CUDA cache after processing
+        if state.cuda_available:
+            torch.cuda.empty_cache()
+            
         return result
     
     except Exception as e:
@@ -436,6 +434,109 @@ def api_unload_model():
     """API endpoint to unload the current model."""
     result = unload_model()
     return jsonify(result)
+
+@app.route("/api/process-image-v2", methods=["POST"])
+def api_process_image_resnet():
+    """REST API endpoint for image recognition with ResNet."""
+    if "image" not in request.json:
+        return jsonify({"success": False, "message": "No image provided"})
+    
+    try:
+        # Clear CUDA cache before processing
+        if state.cuda_available:
+            torch.cuda.empty_cache()
+            
+        # Get image data
+        image_data = request.json["image"]
+        
+        # Process image
+        image = preprocess_image(image_data)
+        image = resize_image_for_processing(image, max_size=384)  # Lower resolution for memory efficiency
+        
+        if state.loaded_model is None or state.loaded_processor is None:
+            return jsonify({"success": False, "message": "No model is loaded"})
+        
+        # ResNet-specific processing
+        try:
+            # Prepare the image
+            inputs = state.loaded_processor(images=image, return_tensors="pt")
+            
+            # Process on CPU first
+            with torch.no_grad():
+                # Optional: Move to GPU just for inference if there's enough memory
+                if state.cuda_available:
+                    # Get a chunk of GPU that we can fit in memory
+                    try:
+                        # Move model temporarily to GPU for faster inference
+                        state.loaded_model.to("cuda")
+                        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                        use_cuda = True
+                    except Exception as e:
+                        logger.warning(f"Could not use CUDA for inference: {e}")
+                        state.loaded_model.to("cpu")
+                        inputs = {k: v.to("cpu") for k, v in inputs.items()}
+                        use_cuda = False
+                else:
+                    inputs = {k: v.to("cpu") for k, v in inputs.items()}
+                    use_cuda = False
+                
+                # Run inference
+                logger.info(f"Running inference on: {'CUDA' if use_cuda else 'CPU'}")
+                outputs = state.loaded_model(**inputs)
+                
+                # Move model back to CPU to save GPU memory
+                if use_cuda:
+                    state.loaded_model.to("cpu")
+                    torch.cuda.empty_cache()
+                
+            # Process the logits
+            logits = outputs.logits
+            predicted_class_idx = logits.argmax(-1).item()
+            
+            # Get the label for the predicted class
+            if hasattr(state.loaded_model.config, "id2label"):
+                result = state.loaded_model.config.id2label[predicted_class_idx]
+            else:
+                result = f"Class {predicted_class_idx}"
+                
+            # Get top 5 predictions for more detailed results
+            probs = torch.nn.functional.softmax(logits, dim=-1)[0]
+            top5_probs, top5_indices = torch.topk(probs, 5)
+            
+            top5_results = []
+            for i, (prob, idx) in enumerate(zip(top5_probs.tolist(), top5_indices.tolist())):
+                if hasattr(state.loaded_model.config, "id2label"):
+                    label = state.loaded_model.config.id2label[idx]
+                else:
+                    label = f"Class {idx}"
+                
+                top5_results.append(f"{label}: {prob*100:.2f}%")
+            
+            # Combine into a more detailed result
+            result = f"Top prediction: {result}\n\nTop 5 predictions:\n" + "\n".join(top5_results)
+                
+        except Exception as e:
+            logger.error(f"ResNet processing failed: {e}", exc_info=True)
+            return jsonify({
+                "success": False,
+                "message": f"Error processing with ResNet model: {str(e)}"
+            })
+        
+        # Clear CUDA cache after processing
+        if state.cuda_available:
+            torch.cuda.empty_cache()
+            
+        return jsonify({
+            "success": True,
+            "result": result
+        })
+        
+    except Exception as e:
+        logger.error(f"REST API process error: {e}", exc_info=True)
+        return jsonify({
+            "success": False,
+            "message": f"Error processing image: {str(e)}"
+        })
 
 @app.route("/api/process", methods=["POST"])
 def api_process_image():
