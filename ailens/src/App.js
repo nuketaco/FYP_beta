@@ -99,7 +99,7 @@ function App() {
       });
 
     // Establish Socket.IO connection
-    const socket = io('http://localhost:5000', {
+    const socket = io('/', {
       reconnection: true,
       reconnectionAttempts: 10,
       reconnectionDelay: 1000,
