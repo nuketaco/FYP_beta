@@ -1,6 +1,6 @@
 {
-  "short_name": "AI Vision",
-  "name": "AI Vision Recognition",
+  "short_name": "AI lens",
+  "name": " local LLM powered image Recognition app",
   "icons": [
     {
       "src": "favicon.ico",
